@@ -1,0 +1,688 @@
+// ============================================================================
+// PRODUCTION BACKEND API SERVER
+// Stack: Node.js + Express + PostgreSQL + Spotify API
+// ============================================================================
+
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const crypto = require('crypto');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// ============================================================================
+// DATABASE CONNECTION (PostgreSQL)
+// ============================================================================
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'music_optimizer',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Database schema initialization
+const initDatabase = async () => {
+  const createTablesQuery = `
+    -- Users table
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      spotify_id VARCHAR(255) UNIQUE NOT NULL,
+      email VARCHAR(255),
+      display_name VARCHAR(255),
+      access_token TEXT,
+      refresh_token TEXT,
+      token_expires_at TIMESTAMP,
+      subscription_tier VARCHAR(50) DEFAULT 'free',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Artist profiles table
+    CREATE TABLE IF NOT EXISTS artist_profiles (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      archetype VARCHAR(50),
+      confidence DECIMAL(3,2),
+      monthly_streams INTEGER,
+      monthly_listeners INTEGER,
+      engagement_score DECIMAL(5,2),
+      geographic_reach VARCHAR(50),
+      revenue_potential DECIMAL(10,2),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Recommendations table
+    CREATE TABLE IF NOT EXISTS recommendations (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      profile_id INTEGER REFERENCES artist_profiles(id),
+      recommended_plan_id VARCHAR(100),
+      confidence_score DECIMAL(5,2),
+      projected_revenue DECIMAL(10,2),
+      status VARCHAR(50) DEFAULT 'pending',
+      requires_expert_review BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- User context table
+    CREATE TABLE IF NOT EXISTS user_contexts (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      goals TEXT[],
+      budget DECIMAL(10,2),
+      upcoming_releases INTEGER,
+      preferred_features TEXT[],
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Feedback table
+    CREATE TABLE IF NOT EXISTS feedback (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      recommendation_id INTEGER REFERENCES recommendations(id),
+      feedback_type VARCHAR(50),
+      plan_chosen VARCHAR(100),
+      comments TEXT,
+      satisfaction_score INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Expert reviews table
+    CREATE TABLE IF NOT EXISTS expert_reviews (
+      id SERIAL PRIMARY KEY,
+      recommendation_id INTEGER REFERENCES recommendations(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approved BOOLEAN,
+      suggested_alternative VARCHAR(100),
+      reasoning TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Create indexes for better performance
+    CREATE INDEX IF NOT EXISTS idx_users_spotify_id ON users(spotify_id);
+    CREATE INDEX IF NOT EXISTS idx_recommendations_user_id ON recommendations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_feedback_recommendation_id ON feedback(recommendation_id);
+  `;
+
+  try {
+    await pool.query(createTablesQuery);
+    console.log('✅ Database tables initialized');
+  } catch (error) {
+    console.error('❌ Database initialization error:', error);
+  }
+};
+
+initDatabase();
+
+// ============================================================================
+// SPOTIFY API INTEGRATION
+// ============================================================================
+
+const SPOTIFY_CONFIG = {
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+  redirectUri: process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:3000/callback',
+  scopes: [
+    'user-read-email',
+    'user-read-private',
+    'user-top-read',
+    'user-read-recently-played'
+  ]
+};
+
+class SpotifyService {
+  // Generate authorization URL
+  static getAuthUrl() {
+    const state = crypto.randomBytes(16).toString('hex');
+    const params = new URLSearchParams({
+      client_id: SPOTIFY_CONFIG.clientId,
+      response_type: 'code',
+      redirect_uri: SPOTIFY_CONFIG.redirectUri,
+      scope: SPOTIFY_CONFIG.scopes.join(' '),
+      state: state
+    });
+    return `https://accounts.spotify.com/authorize?${params.toString()}`;
+  }
+
+  // Exchange authorization code for access token
+  static async getAccessToken(code) {
+    try {
+      const response = await axios.post(
+        'https://accounts.spotify.com/api/token',
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: code,
+          redirect_uri: SPOTIFY_CONFIG.redirectUri
+        }),
+        {
+          headers: {
+            'Authorization': 'Basic ' + Buffer.from(
+              SPOTIFY_CONFIG.clientId + ':' + SPOTIFY_CONFIG.clientSecret
+            ).toString('base64'),
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+      return response.data;
+    } catch (error) {
+      console.error('Spotify token exchange error:', error.response?.data);
+      throw new Error('Failed to exchange code for token');
+    }
+  }
+
+  // Refresh access token
+  static async refreshAccessToken(refreshToken) {
+    try {
+      const response = await axios.post(
+        'https://accounts.spotify.com/api/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken
+        }),
+        {
+          headers: {
+            'Authorization': 'Basic ' + Buffer.from(
+              SPOTIFY_CONFIG.clientId + ':' + SPOTIFY_CONFIG.clientSecret
+            ).toString('base64'),
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+      return response.data;
+    } catch (error) {
+      console.error('Token refresh error:', error.response?.data);
+      throw new Error('Failed to refresh token');
+    }
+  }
+
+  // Get user profile
+  static async getUserProfile(accessToken) {
+    try {
+      const response = await axios.get('https://api.spotify.com/v1/me', {
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Get user profile error:', error.response?.data);
+      throw new Error('Failed to get user profile');
+    }
+  }
+
+  // Get artist analytics (simulated - Spotify for Artists API is invite-only)
+  static async getArtistMetrics(accessToken) {
+    try {
+      // In production, integrate with Spotify for Artists API
+      // For now, we'll use available endpoints and extrapolate
+
+      const [topTracks, recentlyPlayed, profile] = await Promise.all([
+        axios.get('https://api.spotify.com/v1/me/top/tracks?limit=50', {
+          headers: { 'Authorization': `Bearer ${accessToken}` }
+        }),
+        axios.get('https://api.spotify.com/v1/me/player/recently-played?limit=50', {
+          headers: { 'Authorization': `Bearer ${accessToken}` }
+        }),
+        this.getUserProfile(accessToken)
+      ]);
+
+      // Extract meaningful metrics
+      const tracks = topTracks.data.items;
+      const totalPopularity = tracks.reduce((sum, track) => sum + track.popularity, 0);
+      const avgPopularity = totalPopularity / tracks.length;
+
+      // Estimate metrics based on available data
+      // In production: Use real Spotify for Artists API
+      return {
+        monthly_streams: Math.floor(avgPopularity * 1000), // Approximation
+        monthly_listeners: Math.floor(avgPopularity * 500),
+        avg_stream_duration: 0.75, // Estimated
+        skip_rate: 0.15,
+        playlist_adds: Math.floor(avgPopularity * 10),
+        follower_count: profile.followers?.total || 0,
+        geographic_spread: 15, // Would need Spotify for Artists API
+        release_frequency: 2,
+        catalog_size: tracks.length,
+        top_tracks: tracks.slice(0, 5).map(t => ({
+          name: t.name,
+          popularity: t.popularity,
+          uri: t.uri
+        }))
+      };
+    } catch (error) {
+      console.error('Get artist metrics error:', error.response?.data);
+      throw new Error('Failed to get artist metrics');
+    }
+  }
+}
+
+// ============================================================================
+// RECOMMENDATION ENGINE
+// ============================================================================
+
+const DISTRIBUTION_PLANS = [
+  {
+    id: 'distrokid-free',
+    name: "Free Tier",
+    provider: "DistroKid",
+    annual_cost: 0,
+    rev_share_pct: 85,
+    features: ["Basic distribution", "Limited analytics"],
+    best_for: "emerging"
+  },
+  {
+    id: 'distrokid-musician',
+    name: "Musician",
+    provider: "DistroKid",
+    annual_cost: 22.99,
+    rev_share_pct: 100,
+    features: ["Unlimited uploads", "Keep 100%", "Basic analytics", "Spotify pre-save"],
+    best_for: "emerging"
+  },
+  {
+    id: 'tunecore-pro',
+    name: "Professional",
+    provider: "TuneCore",
+    annual_cost: 49.99,
+    rev_share_pct: 100,
+    features: ["Unlimited uploads", "Advanced analytics", "YouTube monetization"],
+    best_for: "growing"
+  },
+  {
+    id: 'cdbaby-rising',
+    name: "Rising",
+    provider: "CD Baby",
+    annual_cost: 29.95,
+    rev_share_pct: 91,
+    features: ["Distribution", "Publishing admin", "Sync licensing"],
+    best_for: "niche"
+  },
+  {
+    id: 'awal-label',
+    name: "Label Services",
+    provider: "AWAL",
+    annual_cost: 0,
+    rev_share_pct: 85,
+    features: ["Full service", "Marketing support", "Advance opportunities"],
+    best_for: "established"
+  },
+  {
+    id: 'stem-premium',
+    name: "Premium",
+    provider: "Stem",
+    annual_cost: 99.99,
+    rev_share_pct: 100,
+    features: ["Advanced splits", "Real-time analytics", "Financial tools"],
+    best_for: "established"
+  }
+];
+
+class RecommendationEngine {
+  static analyzeArtist(metrics, context = {}) {
+    const streams = metrics.monthly_streams;
+    const engagement = metrics.avg_stream_duration * 100;
+    const followers = metrics.follower_count;
+
+    // Detect archetype
+    let archetype, confidence;
+    if (streams < 10000) {
+      archetype = followers < 1000 ? "emerging" : "niche";
+      confidence = 0.85;
+    } else if (streams < 50000) {
+      archetype = engagement > 60 ? "growing" : "niche";
+      confidence = 0.80;
+    } else if (streams < 200000) {
+      archetype = followers > 10000 ? "established" : "growing";
+      confidence = 0.90;
+    } else {
+      archetype = "established";
+      confidence = 0.95;
+    }
+
+    const profile = {
+      archetype,
+      confidence,
+      monthly_revenue: streams * 0.003,
+      engagement_score: engagement,
+      geographic_reach: metrics.geographic_spread > 10 ? "international" : "regional"
+    };
+
+    // Score each plan
+    const scoredPlans = DISTRIBUTION_PLANS.map(plan => {
+      let score = 0;
+
+      // Archetype match
+      if (plan.best_for === archetype) score += 40;
+
+      // ROI calculation
+      const annual_revenue = profile.monthly_revenue * 12;
+      const net_revenue = (annual_revenue * plan.rev_share_pct / 100) - plan.annual_cost;
+      if (net_revenue > 0) {
+        score += 30 * (net_revenue / Math.max(annual_revenue, 1));
+      }
+
+      // Context adjustments
+      if (context.budget && plan.annual_cost <= context.budget) score += 10;
+      if (context.goals?.includes('revenue_max') && plan.rev_share_pct === 100) score += 10;
+      if (context.goals?.includes('sync_licensing') && 
+          plan.features.some(f => f.toLowerCase().includes('sync'))) score += 10;
+
+      return {
+        plan,
+        score: Math.min(score, 100),
+        net_revenue,
+        annual_revenue
+      };
+    });
+
+    scoredPlans.sort((a, b) => b.score - a.score);
+
+    return {
+      profile,
+      recommended: scoredPlans[0],
+      alternatives: scoredPlans.slice(1, 3),
+      needsExpertReview: confidence < 0.70 || scoredPlans[0].score < 70
+    };
+  }
+}
+
+// ============================================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================================
+
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+};
+
+// ============================================================================
+// API ROUTES
+// ============================================================================
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Get Spotify authorization URL
+app.get('/api/auth/spotify', (req, res) => {
+  const authUrl = SpotifyService.getAuthUrl();
+  res.json({ authUrl });
+});
+
+// Spotify callback handler
+app.post('/api/auth/spotify/callback', async (req, res) => {
+  const { code } = req.body;
+
+  try {
+    // Exchange code for tokens
+    const tokenData = await SpotifyService.getAccessToken(code);
+    const profile = await SpotifyService.getUserProfile(tokenData.access_token);
+
+    // Store or update user in database
+    const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
+    
+    const userQuery = `
+      INSERT INTO users (spotify_id, email, display_name, access_token, refresh_token, token_expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (spotify_id) 
+      DO UPDATE SET 
+        access_token = $4,
+        refresh_token = $5,
+        token_expires_at = $6,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING id, spotify_id, email, display_name, subscription_tier
+    `;
+
+    const result = await pool.query(userQuery, [
+      profile.id,
+      profile.email,
+      profile.display_name,
+      tokenData.access_token,
+      tokenData.refresh_token,
+      expiresAt
+    ]);
+
+    const user = result.rows[0];
+
+    // Generate JWT for our app
+    const jwtToken = jwt.sign(
+      { userId: user.id, spotifyId: user.spotify_id },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      token: jwtToken,
+      user: {
+        id: user.id,
+        spotifyId: user.spotify_id,
+        email: user.email,
+        displayName: user.display_name,
+        subscriptionTier: user.subscription_tier
+      }
+    });
+  } catch (error) {
+    console.error('Callback error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Get artist metrics
+app.get('/api/metrics', authenticateToken, async (req, res) => {
+  try {
+    // Get user's Spotify access token
+    const userQuery = 'SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = $1';
+    const userResult = await pool.query(userQuery, [req.userId]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    let { access_token, refresh_token, token_expires_at } = userResult.rows[0];
+
+    // Check if token needs refresh
+    if (new Date() >= new Date(token_expires_at)) {
+      const newTokenData = await SpotifyService.refreshAccessToken(refresh_token);
+      access_token = newTokenData.access_token;
+      
+      // Update token in database
+      await pool.query(
+        'UPDATE users SET access_token = $1, token_expires_at = $2 WHERE id = $3',
+        [access_token, new Date(Date.now() + newTokenData.expires_in * 1000), req.userId]
+      );
+    }
+
+    // Fetch metrics from Spotify
+    const metrics = await SpotifyService.getArtistMetrics(access_token);
+    
+    res.json({ metrics });
+  } catch (error) {
+    console.error('Metrics error:', error);
+    res.status(500).json({ error: 'Failed to fetch metrics' });
+  }
+});
+
+// Save user context
+app.post('/api/context', authenticateToken, async (req, res) => {
+  const { goals, budget, upcomingReleases, preferredFeatures } = req.body;
+
+  try {
+    const query = `
+      INSERT INTO user_contexts (user_id, goals, budget, upcoming_releases, preferred_features)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id
+    `;
+
+    const result = await pool.query(query, [
+      req.userId,
+      goals,
+      budget,
+      upcomingReleases,
+      preferredFeatures || []
+    ]);
+
+    res.json({ contextId: result.rows[0].id });
+  } catch (error) {
+    console.error('Save context error:', error);
+    res.status(500).json({ error: 'Failed to save context' });
+  }
+});
+
+// Generate recommendation
+app.post('/api/recommend', authenticateToken, async (req, res) => {
+  const { metrics, context } = req.body;
+
+  try {
+    // Generate recommendation
+    const recommendation = RecommendationEngine.analyzeArtist(metrics, context);
+
+    // Save profile
+    const profileQuery = `
+      INSERT INTO artist_profiles 
+      (user_id, archetype, confidence, monthly_streams, monthly_listeners, 
+       engagement_score, geographic_reach, revenue_potential)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id
+    `;
+
+    const profileResult = await pool.query(profileQuery, [
+      req.userId,
+      recommendation.profile.archetype,
+      recommendation.profile.confidence,
+      metrics.monthly_streams,
+      metrics.monthly_listeners,
+      recommendation.profile.engagement_score,
+      recommendation.profile.geographic_reach,
+      recommendation.profile.monthly_revenue
+    ]);
+
+    const profileId = profileResult.rows[0].id;
+
+    // Save recommendation
+    const recQuery = `
+      INSERT INTO recommendations 
+      (user_id, profile_id, recommended_plan_id, confidence_score, 
+       projected_revenue, requires_expert_review)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id
+    `;
+
+    const recResult = await pool.query(recQuery, [
+      req.userId,
+      profileId,
+      recommendation.recommended.plan.id,
+      recommendation.recommended.score,
+      recommendation.recommended.net_revenue,
+      recommendation.needsExpertReview
+    ]);
+
+    res.json({
+      recommendationId: recResult.rows[0].id,
+      ...recommendation
+    });
+  } catch (error) {
+    console.error('Recommendation error:', error);
+    res.status(500).json({ error: 'Failed to generate recommendation' });
+  }
+});
+
+// Submit feedback
+app.post('/api/feedback', authenticateToken, async (req, res) => {
+  const { recommendationId, feedbackType, planChosen, comments, satisfactionScore } = req.body;
+
+  try {
+    const query = `
+      INSERT INTO feedback 
+      (user_id, recommendation_id, feedback_type, plan_chosen, comments, satisfaction_score)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id
+    `;
+
+    const result = await pool.query(query, [
+      req.userId,
+      recommendationId,
+      feedbackType,
+      planChosen,
+      comments,
+      satisfactionScore
+    ]);
+
+    res.json({ feedbackId: result.rows[0].id });
+  } catch (error) {
+    console.error('Feedback error:', error);
+    res.status(500).json({ error: 'Failed to submit feedback' });
+  }
+});
+
+// Get user dashboard data
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        u.display_name,
+        u.subscription_tier,
+        ap.archetype,
+        ap.monthly_streams,
+        ap.revenue_potential,
+        r.recommended_plan_id,
+        r.projected_revenue,
+        r.created_at as recommendation_date
+      FROM users u
+      LEFT JOIN artist_profiles ap ON ap.user_id = u.id
+      LEFT JOIN recommendations r ON r.user_id = u.id
+      WHERE u.id = $1
+      ORDER BY r.created_at DESC
+      LIMIT 1
+    `;
+
+    const result = await pool.query(query, [req.userId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No data found' });
+    }
+
+    res.json({ dashboard: result.rows[0] });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard' });
+  }
+});
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+app.listen(PORT, () => {
+  console.log(`
+    🎸 Music Revenue Optimizer API Server
+    =====================================
+    🚀 Server running on port ${PORT}
+    🔗 Environment: ${process.env.NODE_ENV || 'development'}
+    📊 Database: ${process.env.DB_NAME || 'music_optimizer'}
+    =====================================
+  `);
+});
+
+module.exports = app;

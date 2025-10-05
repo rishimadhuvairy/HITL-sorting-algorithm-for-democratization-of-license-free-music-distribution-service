@@ -1,0 +1,716 @@
+import json
+import statistics
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional, Callable
+from datetime import datetime, timedelta
+from enum import Enum
+import random
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class ReviewStatus(Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    NEEDS_EXPERT = "needs_expert"
+
+class FeedbackType(Enum):
+    HELPFUL = "helpful"
+    NOT_HELPFUL = "not_helpful"
+    PARTIALLY_HELPFUL = "partially_helpful"
+    CHOSE_DIFFERENT = "chose_different"
+
+@dataclass
+class StreamingMetrics:
+    """Raw streaming data from platforms"""
+    artist_id: str
+    platform: str
+    monthly_streams: int
+    monthly_listeners: int
+    avg_stream_duration: float
+    skip_rate: float
+    playlist_adds: int
+    follower_count: int
+    geographic_spread: int
+    release_frequency: float
+    catalog_size: int
+    
+@dataclass
+class ArtistContext:
+    """HITL: Artist-provided context beyond metrics"""
+    artist_id: str
+    goals: List[str]
+    upcoming_releases: int
+    has_label: bool
+    budget_constraint: Optional[float]
+    preferred_features: List[str]
+    notes: str
+    submitted_at: datetime = field(default_factory=datetime.now)
+    
+@dataclass
+class DistributionPlan:
+    """Distribution service plan details"""
+    name: str
+    provider: str
+    annual_cost: float
+    rev_share_pct: float
+    features: List[str]
+    min_streams_breakeven: int
+    best_for_profile: str
+    
+@dataclass
+class ArtistProfile:
+    """Detected artist archetype and characteristics"""
+    artist_id: str
+    archetype: str
+    stream_velocity: float
+    engagement_score: float
+    geographic_reach: str
+    release_strategy: str
+    revenue_potential: float
+    confidence: float
+    needs_review: bool = False
+    
+@dataclass
+class ExpertReview:
+    """HITL: Expert validation of recommendations"""
+    reviewer_id: str
+    artist_id: str
+    original_recommendation: str
+    approved: bool
+    suggested_alternative: Optional[str]
+    reasoning: str
+    review_date: datetime = field(default_factory=datetime.now)
+    
+@dataclass
+class ArtistFeedback:
+    """HITL: Post-recommendation feedback"""
+    artist_id: str
+    recommendation_id: str
+    feedback_type: FeedbackType
+    plan_chosen: str
+    actual_outcome: Optional[Dict]
+    comments: str
+    submitted_at: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class Recommendation:
+    """Matched distribution plan with HITL checkpoints"""
+    recommendation_id: str
+    artist_id: str
+    recommended_plan: DistributionPlan
+    alternative_plans: List[DistributionPlan]
+    current_plan: Optional[DistributionPlan]
+    projected_annual_revenue: float
+    savings_or_gain: float
+    confidence_score: float
+    reasoning: List[str]
+    status: ReviewStatus = ReviewStatus.PENDING
+    requires_expert_review: bool = False
+    artist_context_considered: bool = False
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+# ============================================================================
+# DATA ACQUISITION
+# ============================================================================
+
+class StreamingDataAcquisition:
+    """Simulates fetching data from streaming platforms"""
+    
+    @staticmethod
+    def fetch_spotify_metrics(artist_id: str) -> StreamingMetrics:
+        return StreamingMetrics(
+            artist_id=artist_id,
+            platform="spotify",
+            monthly_streams=random.randint(1000, 500000),
+            monthly_listeners=random.randint(500, 100000),
+            avg_stream_duration=random.uniform(0.3, 0.95),
+            skip_rate=random.uniform(0.05, 0.40),
+            playlist_adds=random.randint(10, 5000),
+            follower_count=random.randint(100, 50000),
+            geographic_spread=random.randint(5, 75),
+            release_frequency=random.uniform(0.5, 4),
+            catalog_size=random.randint(3, 50)
+        )
+    
+    @staticmethod
+    def aggregate_platform_metrics(artist_id: str) -> Dict[str, StreamingMetrics]:
+        return {
+            "spotify": StreamingDataAcquisition.fetch_spotify_metrics(artist_id),
+        }
+
+
+# ============================================================================
+# HITL: ARTIST CONTEXT COLLECTION
+# ============================================================================
+
+class ArtistContextCollector:
+    """HITL: Collect qualitative context from artists"""
+    
+    @staticmethod
+    def collect_context(artist_id: str, interactive: bool = True) -> ArtistContext:
+        """Simulate artist questionnaire (in prod: web form)"""
+        if interactive:
+            print(f"\n🎤 ARTIST INPUT NEEDED for {artist_id}")
+            print("=" * 60)
+            print("Help us understand your goals beyond the numbers:\n")
+            
+            # Simulated responses
+            goals = random.choice([
+                ["fanbase_growth", "touring_prep"],
+                ["revenue_max", "international_expansion"],
+                ["fanbase_growth", "revenue_max"],
+                ["brand_building", "sync_licensing"]
+            ])
+            
+            upcoming = random.randint(1, 6)
+            has_label = random.choice([True, False])
+            budget = random.choice([None, 50, 100, 200])
+            features = random.choice([
+                ["analytics", "unlimited_uploads"],
+                ["sync_licensing", "youtube_monetization"],
+                ["marketing_support", "advance_opportunities"]
+            ])
+            
+            print(f"  Goals: {', '.join(goals)}")
+            print(f"  Upcoming releases (next 6mo): {upcoming}")
+            print(f"  Has label support: {has_label}")
+            print(f"  Budget constraint: ${budget}/year" if budget else "  Budget: Flexible")
+            print(f"  Must-have features: {', '.join(features)}")
+            print()
+            
+            return ArtistContext(
+                artist_id=artist_id,
+                goals=goals,
+                upcoming_releases=upcoming,
+                has_label=has_label,
+                budget_constraint=budget,
+                preferred_features=features,
+                notes="Collected via questionnaire"
+            )
+        
+        return ArtistContext(
+            artist_id=artist_id,
+            goals=["revenue_max"],
+            upcoming_releases=2,
+            has_label=False,
+            budget_constraint=None,
+            preferred_features=[],
+            notes="Default context"
+        )
+
+
+# ============================================================================
+# METRICS PARSER (Pure Python - No NumPy)
+# ============================================================================
+
+class MetricsParser:
+    @staticmethod
+    def weighted_average(values: List[float], weights: List[float]) -> float:
+        """Calculate weighted average without numpy"""
+        if not values or not weights or len(values) != len(weights):
+            return 0.0
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return 0.0
+        weighted_sum = sum(v * w for v, w in zip(values, weights))
+        return weighted_sum / total_weight
+    
+    @staticmethod
+    def normalize_metrics(metrics: Dict[str, StreamingMetrics]) -> Dict[str, float]:
+        total_streams = sum(m.monthly_streams for m in metrics.values())
+        total_listeners = sum(m.monthly_listeners for m in metrics.values())
+        
+        # Weighted averages using stream counts as weights
+        stream_counts = [m.monthly_streams for m in metrics.values()]
+        durations = [m.avg_stream_duration for m in metrics.values()]
+        skip_rates = [m.skip_rate for m in metrics.values()]
+        
+        avg_duration = MetricsParser.weighted_average(durations, stream_counts)
+        avg_skip = MetricsParser.weighted_average(skip_rates, stream_counts)
+        
+        return {
+            "total_monthly_streams": total_streams,
+            "total_monthly_listeners": total_listeners,
+            "avg_stream_duration": avg_duration,
+            "avg_skip_rate": avg_skip,
+            "total_playlist_adds": sum(m.playlist_adds for m in metrics.values()),
+            "total_followers": sum(m.follower_count for m in metrics.values()),
+            "geographic_spread": max(m.geographic_spread for m in metrics.values()),
+            "release_frequency": statistics.mean([m.release_frequency for m in metrics.values()]),
+            "catalog_size": statistics.mean([m.catalog_size for m in metrics.values()]),
+            "listener_to_stream_ratio": total_streams / max(total_listeners, 1),
+            "engagement_score": (avg_duration * (1 - avg_skip)) * 100
+        }
+
+
+# ============================================================================
+# PATTERN DETECTION WITH HITL
+# ============================================================================
+
+class ArtistProfileDetector:
+    """Pattern detection with confidence scoring for HITL"""
+    
+    @staticmethod
+    def detect_archetype_with_confidence(normalized: Dict[str, float]) -> tuple:
+        """Returns archetype AND confidence score"""
+        streams = normalized["total_monthly_streams"]
+        engagement = normalized["engagement_score"]
+        followers = normalized["total_followers"]
+        
+        # Edge case detection
+        edge_cases = []
+        ratio = normalized["listener_to_stream_ratio"]
+        if ratio > 50 or ratio < 0.5:
+            edge_cases.append("unusual_listener_ratio")
+        if engagement < 30:
+            edge_cases.append("very_low_engagement")
+        
+        # Archetype detection
+        if streams < 10000:
+            archetype = "emerging" if followers < 1000 else "niche"
+            confidence = 0.85 if not edge_cases else 0.60
+        elif streams < 50000:
+            archetype = "growing" if engagement > 60 else "niche"
+            confidence = 0.80 if not edge_cases else 0.55
+        elif streams < 200000:
+            archetype = "established" if followers > 10000 else "growing"
+            confidence = 0.90 if not edge_cases else 0.70
+        else:
+            archetype = "established"
+            confidence = 0.95 if not edge_cases else 0.75
+        
+        return archetype, confidence
+    
+    @staticmethod
+    def create_profile(artist_id: str, metrics: Dict[str, StreamingMetrics]) -> ArtistProfile:
+        normalized = MetricsParser.normalize_metrics(metrics)
+        archetype, confidence = ArtistProfileDetector.detect_archetype_with_confidence(normalized)
+        
+        needs_review = confidence < 0.70
+        
+        # Stream velocity calculation
+        stream_velocity = min((normalized["release_frequency"] * normalized["total_playlist_adds"]) / 100, 10.0)
+        
+        return ArtistProfile(
+            artist_id=artist_id,
+            archetype=archetype,
+            stream_velocity=stream_velocity,
+            engagement_score=normalized["engagement_score"],
+            geographic_reach="international" if normalized["geographic_spread"] > 50 else "national",
+            release_strategy="consistent" if normalized["release_frequency"] >= 2 else "sporadic",
+            revenue_potential=normalized["total_monthly_streams"] * 0.003,
+            confidence=confidence,
+            needs_review=needs_review
+        )
+
+
+# ============================================================================
+# DISTRIBUTION PLANS
+# ============================================================================
+
+DISTRIBUTION_PLANS = [
+    DistributionPlan(
+        name="Free Tier",
+        provider="DistroKid",
+        annual_cost=0,
+        rev_share_pct=85,
+        features=["Basic distribution", "Limited analytics"],
+        min_streams_breakeven=0,
+        best_for_profile="emerging"
+    ),
+    DistributionPlan(
+        name="Musician",
+        provider="DistroKid",
+        annual_cost=22.99,
+        rev_share_pct=100,
+        features=["Unlimited uploads", "Keep 100%", "Basic analytics"],
+        min_streams_breakeven=7663,
+        best_for_profile="emerging"
+    ),
+    DistributionPlan(
+        name="Professional",
+        provider="TuneCore",
+        annual_cost=49.99,
+        rev_share_pct=100,
+        features=["Unlimited uploads", "Advanced analytics", "YouTube monetization"],
+        min_streams_breakeven=16663,
+        best_for_profile="growing"
+    ),
+    DistributionPlan(
+        name="Rising",
+        provider="CD Baby",
+        annual_cost=29.95,
+        rev_share_pct=91,
+        features=["Distribution", "Publishing admin", "Sync licensing"],
+        min_streams_breakeven=10000,
+        best_for_profile="niche"
+    ),
+    DistributionPlan(
+        name="Label Services",
+        provider="AWAL",
+        annual_cost=0,
+        rev_share_pct=85,
+        features=["Full service", "Marketing support", "Advance opportunities"],
+        min_streams_breakeven=20000,
+        best_for_profile="established"
+    ),
+    DistributionPlan(
+        name="Premium",
+        provider="Stem",
+        annual_cost=99.99,
+        rev_share_pct=100,
+        features=["Advanced splits", "Real-time analytics", "Financial tools"],
+        min_streams_breakeven=33330,
+        best_for_profile="established"
+    )
+]
+
+
+# ============================================================================
+# MATCHING WITH HITL
+# ============================================================================
+
+class DistributionMatcher:
+    """Matching algorithm with artist context integration"""
+    
+    @staticmethod
+    def calculate_plan_score(profile: ArtistProfile, plan: DistributionPlan, 
+                           context: Optional[ArtistContext] = None) -> float:
+        """Score with optional artist context"""
+        score = 0.0
+        
+        # Base scoring
+        if plan.best_for_profile == profile.archetype:
+            score += 35
+        
+        monthly_revenue = profile.revenue_potential
+        annual_revenue = monthly_revenue * 12
+        net_annual = (annual_revenue * plan.rev_share_pct / 100) - plan.annual_cost
+        
+        if net_annual > 0:
+            roi_ratio = net_annual / max(annual_revenue, 1)
+            score += 25 * roi_ratio
+        
+        if profile.stream_velocity > 5 and plan.annual_cost > 0:
+            score += 15
+        
+        # HITL: Artist context adjustments
+        if context:
+            if context.budget_constraint and plan.annual_cost <= context.budget_constraint:
+                score += 10
+            elif context.budget_constraint and plan.annual_cost > context.budget_constraint:
+                score -= 20
+            
+            if "revenue_max" in context.goals and plan.rev_share_pct == 100:
+                score += 5
+            if "fanbase_growth" in context.goals and "marketing" in " ".join(plan.features).lower():
+                score += 5
+            if "sync_licensing" in context.goals and "sync" in " ".join(plan.features).lower():
+                score += 10
+            
+            plan_features_lower = " ".join(plan.features).lower()
+            for feature in context.preferred_features:
+                if feature.lower() in plan_features_lower:
+                    score += 5
+        
+        return min(score, 100)
+    
+    @staticmethod
+    def find_best_match(profile: ArtistProfile, 
+                       context: Optional[ArtistContext] = None,
+                       plans: List[DistributionPlan] = None) -> Recommendation:
+        """Find optimal plan with HITL integration"""
+        if plans is None:
+            plans = DISTRIBUTION_PLANS
+        
+        # Score all plans
+        scored_plans = [
+            (plan, DistributionMatcher.calculate_plan_score(profile, plan, context))
+            for plan in plans
+        ]
+        scored_plans.sort(key=lambda x: x[1], reverse=True)
+        
+        best_plan, best_score = scored_plans[0]
+        alternatives = [p for p, s in scored_plans[1:4]]
+        
+        # Calculate projections
+        monthly_rev = profile.revenue_potential
+        annual_gross = monthly_rev * 12
+        annual_net = (annual_gross * best_plan.rev_share_pct / 100) - best_plan.annual_cost
+        
+        # Reasoning
+        reasoning = []
+        reasoning.append(f"Your '{profile.archetype}' profile aligns with this plan")
+        
+        if context:
+            if context.budget_constraint and best_plan.annual_cost <= context.budget_constraint:
+                reasoning.append(f"Fits within your ${context.budget_constraint}/year budget")
+            if "revenue_max" in context.goals:
+                reasoning.append("Maximizes revenue share based on your goals")
+            if context.upcoming_releases > 3 and "unlimited" in " ".join(best_plan.features).lower():
+                reasoning.append(f"Supports your {context.upcoming_releases} upcoming releases")
+        
+        reasoning.append(f"Confidence: {profile.confidence*100:.0f}% based on data quality")
+        
+        # Review requirements
+        requires_expert = (
+            profile.needs_review or 
+            (context and context.has_label) or
+            best_score < 70
+        )
+        
+        rec_id = f"REC-{profile.artist_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        return Recommendation(
+            recommendation_id=rec_id,
+            artist_id=profile.artist_id,
+            recommended_plan=best_plan,
+            alternative_plans=alternatives,
+            current_plan=plans[0],
+            projected_annual_revenue=annual_net,
+            savings_or_gain=annual_net - (annual_gross * 0.85),
+            confidence_score=best_score,
+            reasoning=reasoning,
+            status=ReviewStatus.NEEDS_EXPERT if requires_expert else ReviewStatus.PENDING,
+            requires_expert_review=requires_expert,
+            artist_context_considered=context is not None
+        )
+
+
+# ============================================================================
+# HITL: EXPERT REVIEW
+# ============================================================================
+
+class ExpertReviewSystem:
+    """HITL: Expert validation and override"""
+    
+    @staticmethod
+    def review_recommendation(recommendation: Recommendation, 
+                            reviewer_id: str = "expert_001") -> ExpertReview:
+        """Simulate expert review"""
+        
+        print(f"\n👨‍💼 EXPERT REVIEW for {recommendation.artist_id}")
+        print("=" * 60)
+        print(f"Recommendation: {recommendation.recommended_plan.provider} - {recommendation.recommended_plan.name}")
+        print(f"Algorithm Confidence: {recommendation.confidence_score:.1f}%")
+        print(f"Artist Context Considered: {recommendation.artist_context_considered}")
+        
+        if recommendation.confidence_score > 80:
+            approved = True
+            alternative = None
+            reason = "Recommendation is sound based on metrics and context"
+        elif recommendation.confidence_score > 65:
+            approved = random.choice([True, False])
+            alternative = recommendation.alternative_plans[0].name if not approved else None
+            reason = "Moderate confidence - suggesting alternative" if not approved else "Approved with monitoring"
+        else:
+            approved = False
+            alternative = recommendation.alternative_plans[0].name
+            reason = "Low confidence - recommending safer alternative"
+        
+        print(f"Decision: {'✅ APPROVED' if approved else '❌ OVERRIDE'}")
+        if alternative:
+            print(f"Suggested Alternative: {alternative}")
+        print(f"Reasoning: {reason}\n")
+        
+        return ExpertReview(
+            reviewer_id=reviewer_id,
+            artist_id=recommendation.artist_id,
+            original_recommendation=recommendation.recommended_plan.name,
+            approved=approved,
+            suggested_alternative=alternative,
+            reasoning=reason
+        )
+
+
+# ============================================================================
+# HITL: FEEDBACK LOOP
+# ============================================================================
+
+class FeedbackCollector:
+    """HITL: Collect artist feedback"""
+    
+    @staticmethod
+    def collect_feedback(recommendation: Recommendation, months_after: int = 3) -> ArtistFeedback:
+        """Simulate feedback collection"""
+        
+        print(f"\n📊 FEEDBACK REQUEST (after {months_after} months)")
+        print("=" * 60)
+        print(f"Artist: {recommendation.artist_id}")
+        print(f"Recommended: {recommendation.recommended_plan.name}")
+        
+        feedback_types = list(FeedbackType)
+        feedback = random.choice(feedback_types)
+        
+        if feedback == FeedbackType.CHOSE_DIFFERENT:
+            chosen = recommendation.alternative_plans[0].name
+        else:
+            chosen = recommendation.recommended_plan.name
+        
+        outcome = None
+        if feedback in [FeedbackType.HELPFUL, FeedbackType.PARTIALLY_HELPFUL]:
+            outcome = {
+                "revenue_change_pct": random.uniform(-5, 25),
+                "streams_change_pct": random.uniform(-10, 30),
+                "satisfaction": random.randint(3, 5)
+            }
+        
+        comments_map = {
+            FeedbackType.HELPFUL: "Great recommendation! Seeing real results.",
+            FeedbackType.NOT_HELPFUL: "Didn't match my needs as expected.",
+            FeedbackType.PARTIALLY_HELPFUL: "Good start but needed adjustments.",
+            FeedbackType.CHOSE_DIFFERENT: "Went with different option that felt better."
+        }
+        
+        print(f"Feedback: {feedback.value}")
+        print(f"Plan Chosen: {chosen}")
+        if outcome:
+            print(f"Revenue Change: {outcome['revenue_change_pct']:+.1f}%")
+        print()
+        
+        return ArtistFeedback(
+            artist_id=recommendation.artist_id,
+            recommendation_id=recommendation.recommendation_id,
+            feedback_type=feedback,
+            plan_chosen=chosen,
+            actual_outcome=outcome,
+            comments=comments_map[feedback]
+        )
+
+
+# ============================================================================
+# MAIN ORCHESTRATOR WITH HITL
+# ============================================================================
+
+class HITLRevenueOptimizer:
+    """Complete system with Human-in-the-Loop"""
+    
+    def __init__(self):
+        self.feedback_history = []
+        self.expert_reviews = []
+    
+    def optimize_with_hitl(self, artist_id: str, skip_context: bool = False) -> Recommendation:
+        """Complete pipeline with HITL checkpoints"""
+        
+        print(f"\n{'='*60}")
+        print(f"🎸 ANALYZING ARTIST: {artist_id}")
+        print(f"{'='*60}\n")
+        
+        # Acquire metrics
+        print("📊 Acquiring streaming data...")
+        metrics = StreamingDataAcquisition.aggregate_platform_metrics(artist_id)
+        normalized = MetricsParser.normalize_metrics(metrics)
+        print(f"  Total Monthly Streams: {normalized['total_monthly_streams']:,}")
+        
+        # HITL - Artist context
+        context = None
+        if not skip_context:
+            context = ArtistContextCollector.collect_context(artist_id, interactive=True)
+        
+        # Profile detection
+        print("🎯 Detecting artist profile...")
+        profile = ArtistProfileDetector.create_profile(artist_id, metrics)
+        print(f"  Archetype: {profile.archetype.upper()}")
+        print(f"  Confidence: {profile.confidence*100:.0f}%")
+        
+        if profile.needs_review:
+            print("  ⚠️  Low confidence - flagged for expert review")
+        
+        # Matching
+        print("\n🎵 Finding optimal distribution plan...")
+        recommendation = DistributionMatcher.find_best_match(profile, context)
+        
+        # HITL - Expert review if needed
+        if recommendation.requires_expert_review:
+            expert_review = ExpertReviewSystem.review_recommendation(recommendation)
+            self.expert_reviews.append(expert_review)
+            
+            if not expert_review.approved and expert_review.suggested_alternative:
+                print(f"⚡ Expert override: {expert_review.suggested_alternative}")
+                recommendation.status = ReviewStatus.REJECTED
+        else:
+            recommendation.status = ReviewStatus.APPROVED
+            print("✅ Auto-approved (high confidence)")
+        
+        # Display
+        print(f"\n{'='*60}")
+        print(f"RECOMMENDATION [{recommendation.status.value.upper()}]")
+        print(f"{'='*60}")
+        print(f"\n✨ {recommendation.recommended_plan.provider} - {recommendation.recommended_plan.name}")
+        print(f"   Cost: ${recommendation.recommended_plan.annual_cost:.2f}/year")
+        print(f"   Projected Annual Net: ${recommendation.projected_annual_revenue:.2f}")
+        print(f"\n📋 Reasoning:")
+        for i, reason in enumerate(recommendation.reasoning, 1):
+            print(f"   {i}. {reason}")
+        
+        print(f"\n💡 Alternative Options:")
+        for alt in recommendation.alternative_plans[:2]:
+            print(f"   • {alt.provider} - {alt.name} (${alt.annual_cost}/year)")
+        
+        print(f"\n{'='*60}\n")
+        
+        return recommendation
+    
+    def simulate_feedback_loop(self, recommendation: Recommendation):
+        """Simulate feedback collection"""
+        feedback = FeedbackCollector.collect_feedback(recommendation)
+        self.feedback_history.append(feedback)
+        return feedback
+    
+    def generate_insights(self):
+        """Generate insights from HITL data"""
+        if not self.feedback_history:
+            print("No feedback data yet")
+            return
+        
+        print(f"\n{'='*60}")
+        print("HITL INSIGHTS - MODEL IMPROVEMENT DATA")
+        print(f"{'='*60}\n")
+        
+        helpful_count = sum(1 for f in self.feedback_history if f.feedback_type == FeedbackType.HELPFUL)
+        chose_diff = sum(1 for f in self.feedback_history if f.feedback_type == FeedbackType.CHOSE_DIFFERENT)
+        
+        print(f"Total Feedback: {len(self.feedback_history)}")
+        print(f"Helpful: {helpful_count}/{len(self.feedback_history)} ({helpful_count/len(self.feedback_history)*100:.1f}%)")
+        print(f"Chose Different: {chose_diff}/{len(self.feedback_history)} ({chose_diff/len(self.feedback_history)*100:.1f}%)")
+        
+        expert_overrides = sum(1 for r in self.expert_reviews if not r.approved)
+        print(f"\nExpert Reviews: {len(self.expert_reviews)}")
+        print(f"Expert Overrides: {expert_overrides}/{len(self.expert_reviews)}")
+        
+        print(f"\n💡 Action Items:")
+        if chose_diff > len(self.feedback_history) * 0.3:
+            print("   • High alternative selection - review scoring")
+        if expert_overrides > len(self.expert_reviews) * 0.3:
+            print("   • Frequent overrides - retrain model")
+        print("   • Continue collecting feedback")
+        
+        print(f"\n{'='*60}\n")
+
+
+# ============================================================================
+# DEMO
+# ============================================================================
+
+if __name__ == "__main__":
+    print("\n🎸 HITL MUSIC REVENUE OPTIMIZER 🎸")
+    print("Democratizing Streaming Revenue with Human Expertise\n")
+    
+    optimizer = HITLRevenueOptimizer()
+    
+    test_artists = ["artist_001", "artist_002"]
+    
+    recommendations = []
+    for artist_id in test_artists:
+        rec = optimizer.optimize_with_hitl(artist_id, skip_context=False)
+        recommendations.append(rec)
+        
+        feedback = optimizer.simulate_feedback_loop(rec)
+    
+    optimizer.generate_insights()
+    
+    print("✅ HITL Pipeline Complete!")
